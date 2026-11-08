@@ -117,4 +117,22 @@ def register_model():
     register_model()
 
 
+def register_sleep_mode_backend():
+    import contextlib
+
+    from vllm.device_allocator.sleep_mode_backend import SleepModeBackendFactory
+
+    from .device_allocator.sleep_mode_backend import SLEEP_MODE_BACKEND_CLASS_NAMES
+
+    for name, class_name in SLEEP_MODE_BACKEND_CLASS_NAMES.items():
+        # General plugins load once per process, but engine-core subprocesses can
+        # re-enter this entry point. A duplicate name is not an error.
+        with contextlib.suppress(ValueError):
+            SleepModeBackendFactory.register_backend(
+                name,
+                "vllm_ascend.device_allocator.sleep_mode_backend",
+                class_name,
+            )
+
+
 import vllm_ascend.logger  # noqa: E402, F401

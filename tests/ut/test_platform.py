@@ -18,6 +18,7 @@ from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_pro
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import (
     NPUPlatform,
+    _set_sleep_mode_backend,
     _setup_compile_backend,
     _validate_deepseek_v4_tp_config,
     _validate_draft_decode_context_parallel_config,
@@ -33,6 +34,28 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     dsv4_skips_indexer_topk,
 )
+
+
+@pytest.mark.parametrize(
+    ("enable_sleep_mode", "configured", "expected"),
+    [
+        # Upstream's default cannot run on NPU, so it is replaced.
+        (True, "cumem", "ascend"),
+        # An explicit choice is the user's.
+        (True, "third_party", "third_party"),
+        (False, "cumem", "cumem"),
+    ],
+)
+def test_sleep_mode_backend_replaces_only_the_upstream_default(enable_sleep_mode, configured, expected):
+    model_config = SimpleNamespace(enable_sleep_mode=enable_sleep_mode, sleep_mode_backend=configured)
+
+    _set_sleep_mode_backend(SimpleNamespace(model_config=model_config))
+
+    assert model_config.sleep_mode_backend == expected
+
+
+def test_sleep_mode_backend_selection_tolerates_a_missing_model_config():
+    _set_sleep_mode_backend(SimpleNamespace(model_config=None))
 
 
 @pytest.mark.parametrize("block_size,interleave", [(768, 128), (768, 384), (768, 768), (1536, 768), (1536, 1536)])

@@ -682,6 +682,9 @@ class NPUPlatform(Platform):
         # 10.Set pytorch NPU allocator env (vllm_config)
         _set_pytorch_npu_alloc_env(vllm_config)
 
+        # 11.Select the sleep-mode backend (vllm_config)
+        _set_sleep_mode_backend(vllm_config)
+
     @classmethod
     def set_additional_forward_context(
         cls,
@@ -1692,6 +1695,32 @@ def _validate_sfa_dcp_kv_sp(vllm_config: VllmConfig) -> None:
 
         if is_moe_model(vllm_config) and not vllm_config.parallel_config.enable_expert_parallel:
             raise AssertionError("Sequence parallelism requires enable_expert_parallel=True for MoE models.")
+
+
+UPSTREAM_DEFAULT_SLEEP_MODE_BACKEND = "cumem"
+
+
+def _set_sleep_mode_backend(vllm_config: VllmConfig) -> None:
+    """Point sleep mode at the Ascend backend unless the user picked one.
+
+    Upstream defaults to ``cumem``, whose ``get_mem_allocator_instance()``
+    lookup only resolves on CUDA and XPU and raises on NPU, so leaving that
+    default in place breaks every sleep-mode run here.
+    """
+    model_config = vllm_config.model_config
+    if model_config is None or not model_config.enable_sleep_mode:
+        return
+
+    # Imported here: the backend module reads the resolved platform, and that
+    # resolution is what loads this module in the first place.
+    from vllm_ascend.device_allocator.sleep_mode_backend import ASCEND_SLEEP_MODE_BACKEND
+
+    if model_config.sleep_mode_backend != UPSTREAM_DEFAULT_SLEEP_MODE_BACKEND:
+        # Only replace upstream's own default, never an explicit choice.
+        return
+
+    model_config.sleep_mode_backend = ASCEND_SLEEP_MODE_BACKEND
+    logger.info("Set sleep-mode backend to '%s'.", ASCEND_SLEEP_MODE_BACKEND)
 
 
 def _set_pytorch_npu_alloc_env(vllm_config: VllmConfig) -> None:

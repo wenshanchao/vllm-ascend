@@ -33,6 +33,7 @@ from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+from vllm.device_allocator.sleep_mode_backend import SleepModeBackend, SleepModeBackendFactory
 from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
 from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
@@ -94,6 +95,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
+from vllm_ascend.device_allocator.sleep_mode_backend import AscendSleepBackend, SleepPhase
 from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
@@ -105,7 +107,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwis
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     plan_sparse_kv_offload_memory,
 )
-from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_idle_step
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -212,6 +213,9 @@ class NPUWorker(WorkerBase):
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._sleep_saved_parameters: dict[str, torch.Tensor] = {}
         self.sleep_wakeup_manager = SleepWakeupManager(vllm_config, self, lambda: getattr(self, "model_runner", None))
+        # Resolved lazily on first sleep/wake so worker construction never
+        # touches the device; the instance then lives as long as the worker.
+        self._sleep_mode_backend: SleepModeBackend | None = None
 
         # Weight transfer engine is created in `load_model` once the model
         # is available, since the engine needs a reference to the model.
@@ -301,30 +305,93 @@ class NPUWorker(WorkerBase):
             model.get_parameter(name).copy_(value)
         self._sleep_saved_parameters.clear()
 
-    def sleep(self, level: int = 1) -> None:
-        self.synchronize_device()
-        free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+    def _save_sleep_model_state(self, level: int) -> None:
         # Level-1 only offloads the weights pool. Persistent metadata such as
         # the DSA Hadamard matrix is allocated outside the kv_cache pool, so it
         # stays resident and does not need a CPU backup.
         if level == 1:
             self._sleep_saved_buffers = {}
             self._sleep_saved_parameters = {}
-        else:
-            model = self.model_runner.model
-            # Level-2 discards the weights pool; retain parameters the sender omits.
-            self._save_sleep_parameters(model)
-            self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
+            return
+        model = self.model_runner.model
+        # Level-2 discards the weights pool; retain parameters the sender omits.
+        self._save_sleep_parameters(model)
+        self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
+    def _restore_sleep_model_state(self, tags: list[str] | None) -> None:
+        # Do not access or consume saved weights when only the KV pool wakes.
+        if tags is not None and "weights" not in tags:
+            return
+        if self._sleep_saved_parameters:
+            self._restore_sleep_parameters(self.model_runner.model)
+        # Restore the buffers after level 2 sleep
+        if len(self._sleep_saved_buffers):
+            model = self.model_runner.model
+            for name, buffer in model.named_buffers():
+                if name in self._sleep_saved_buffers:
+                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
+            self._sleep_saved_buffers = {}
+
+    @staticmethod
+    def _sleep_extra_cleanup_enabled() -> bool:
         rl_config = get_ascend_config().rl_config
-        cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
-        if cleanup_enabled:
+        return rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+
+    @property
+    def sleep_mode_backend(self) -> SleepModeBackend:
+        if self._sleep_mode_backend is None:
+            self._sleep_mode_backend = self._create_sleep_mode_backend()
+        return self._sleep_mode_backend
+
+    def _create_sleep_mode_backend(self) -> SleepModeBackend:
+        backend = SleepModeBackendFactory.create_backend(self.model_config)
+        if not isinstance(backend, AscendSleepBackend):
+            return backend
+        # Added in suspend order. Wake-up runs it backwards, so the retained
+        # model state is back in place before ACL graphs are captured again.
+        if self._sleep_extra_cleanup_enabled():
+            backend.add_phase(
+                SleepPhase(
+                    name="hccl_and_acl_graph",
+                    suspend=lambda _request: self.sleep_wakeup_manager.sleep(),
+                    resume=lambda tags: self.sleep_wakeup_manager.wakeup(tags),
+                )
+            )
+        backend.add_phase(
+            SleepPhase(
+                name="model_state",
+                prepare=lambda request: self._save_sleep_model_state(request.level),
+                resume=self._restore_sleep_model_state,
+            )
+        )
+        return backend
+
+    def _suspend_memory_only_backend(self, backend: SleepModeBackend, level: int) -> None:
+        """Sleep with a backend that frees device memory and nothing else.
+
+        ``ascend_legacy`` and third-party backends know nothing about the
+        worker's own resources, so the worker releases those itself first.
+        """
+        self._save_sleep_model_state(level)
+        if self._sleep_extra_cleanup_enabled():
             self.sleep_wakeup_manager.sleep()
         self.synchronize_device()
+        backend.suspend(level)
 
-        allocator = CaMemAllocator.get_instance()
-        global_te.unregister_buffer()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+    def _resume_memory_only_backend(self, backend: SleepModeBackend, tags: list[str] | None) -> None:
+        backend.resume(tags)
+        self._restore_sleep_model_state(tags)
+        if self._sleep_extra_cleanup_enabled():
+            self.sleep_wakeup_manager.wakeup(tags)
+
+    def sleep(self, level: int = 1) -> None:
+        self.synchronize_device()
+        free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+        backend = self.sleep_mode_backend
+        if isinstance(backend, AscendSleepBackend):
+            backend.suspend(level)
+        else:
+            self._suspend_memory_only_backend(backend, level)
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -346,27 +413,11 @@ class NPUWorker(WorkerBase):
                 "or enable additional_config.rl_config (enabled: true) which disables NZ "
                 "automatically."
             )
-        allocator = CaMemAllocator.get_instance()
-        allocator.wake_up(tags=tags)
-        if tags is None or "kv_cache" in tags:
-            global_te.reregister_buffer()
-
-        # Do not access or consume saved weights when only the KV pool wakes.
-        wake_weights = tags is None or "weights" in tags
-        if wake_weights and self._sleep_saved_parameters:
-            self._restore_sleep_parameters(self.model_runner.model)
-        # Restore the buffers after level 2 sleep
-        if wake_weights and len(self._sleep_saved_buffers):
-            model = self.model_runner.model
-            for name, buffer in model.named_buffers():
-                if name in self._sleep_saved_buffers:
-                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
-            self._sleep_saved_buffers = {}
-
-        rl_config = get_ascend_config().rl_config
-        cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
-        if cleanup_enabled:
-            self.sleep_wakeup_manager.wakeup(tags)
+        backend = self.sleep_mode_backend
+        if isinstance(backend, AscendSleepBackend):
+            backend.resume(tags)
+        else:
+            self._resume_memory_only_backend(backend, tags)
         self.synchronize_device()
 
     def _check_weight_transfer_engine(self) -> None:
@@ -460,6 +511,8 @@ class NPUWorker(WorkerBase):
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
                 shutdown_fn()
+        if isinstance(backend := getattr(self, "_sleep_mode_backend", None), AscendSleepBackend):
+            backend.close()
         if engram_error is not None:
             raise engram_error
 
